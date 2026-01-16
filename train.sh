@@ -12,7 +12,6 @@ python launch.py \
   --gpu 3 \
   --train \
   dataset.root_dir=${DATA_PATH} \
-  dataset.scene=${SHAPE_ID} \
   dataset.dense_pcd_path=${DATA_PATH}/sparse/0/points3D.ply \
   tag=iter50k \
   seed=0 \

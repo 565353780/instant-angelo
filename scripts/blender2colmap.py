@@ -8,7 +8,7 @@ import time
 from argparse import ArgumentParser
 import shutil
 import json
-import click
+import math
 
 # from https://github.com/colmap/colmap/tree/dev/scripts/python
 from utils.read_write_model import read_images_binary, rotmat2qvec
@@ -17,6 +17,14 @@ from utils.read_write_model import read_model, write_model
 from utils.database import COLMAPDatabase
 
 colmap_bin = 'colmap'
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('--data', help='path to data dir')
+    parser.add_argument('--output-dir', help='path to output dir')
+    parser.add_argument('--matching-method', default='exhaustive_matcher', choices=['vocab_tree_matcher', 'exhaustive_matcher', 'spatial_matcher', 'squential_matcher'], help='matching method to use (default: vocab_tree_matcher)')
+    args = parser.parse_args()
+    return args
 
 def run_command(command, log_message):
     print(log_message)
@@ -33,13 +41,24 @@ def create_cameras_and_points_txt(target: str, intrinsic_dict):
     with open(f'{target}/model/cameras.txt', 'w') as f:
         f.write(f'1 PINHOLE {intrinsic_dict["width"]} {intrinsic_dict["height"]} {intrinsic_dict["fx"]} {intrinsic_dict["fy"]} {intrinsic_dict["cx"]} {intrinsic_dict["cy"]}')
 
-def project_pinhole(camera, point3D_camera):
-    x_normalized = point3D_camera[0] / point3D_camera[2]
-    y_normalized = point3D_camera[1] / point3D_camera[2]
-    u = camera.params[0] * x_normalized + camera.params[2]
-    v = camera.params[1] * y_normalized + camera.params[3]
-    return np.array([u, v])
+def create_images_txt(target: str, id_list: list, pose_dict: dict, images: list):
+    data_list = []
+    for image in images:
+        id = image[1][:-4]
+        rt = pose_dict[int(id)]
+        rt = np.linalg.inv(rt)
+        r = rt[:3, :3]
+        t = rt[:3, 3]
+        q = rotmat2qvec(r)
+        data = [image[0], *q, *t, 1, f'{id}.png']
+        data = [str(_) for _ in data]
+        data = ' '.join(data)
+        data_list.append(data)
 
+    with open(f'{target}/model/images.txt', 'w') as f:
+        for data in data_list:
+            f.write(data)
+            f.write('\n\n')
 
 def load_K_Rt_from_P(P=None):
     out = cv2.decomposeProjectionMatrix(P)
@@ -57,26 +76,38 @@ def load_K_Rt_from_P(P=None):
 
     return intrinsics, pose
 
-def load_from_dtu(source: str) -> Tuple[list, dict, dict, dict]:
-    cams = np.load(os.path.join(source, 'cameras_sphere.npz'))
-    id_list = list(cams.keys())
-    n_images = max([int(k.split('_')[-1]) for k in id_list]) + 1
+def load_from_blender(source: str) -> Tuple[list, dict, dict, dict]:
+    with open(os.path.join(source, f"transforms_train.json"), 'r') as f:
+        meta = json.load(f)
     
+    if 'w' in meta and 'h' in meta:
+        W, H = int(meta['w']), int(meta['h'])
+    else:
+        W, H = 800, 800
+    focal = 0.5 * W / math.tan(0.5 * meta['camera_angle_x'])
+    
+    id_list = []
     pose_dict = dict()
     image_dict = dict()
-    for i in range(n_images):
-        world_mat, scale_mat = cams[f'world_mat_{i}'], cams[f'scale_mat_{i}']
-        P = (world_mat @ scale_mat)[:3,:4]
-        K, c2w = load_K_Rt_from_P(P)
-        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
-        # c2w[:3,1:3] *= -1. # flip input sign
-        
-        # pose_dict[i] = np.linalg.inv(c2w)
+    mask_dict = dict()
+    for i, frame in enumerate(meta['frames']):
+        id_list.append(i)
+        c2w = np.array(frame['transform_matrix'])
+        c2w[:,1:3] *= -1
         pose_dict[i] = c2w
-        image_dict[i] = os.path.join(source, 'image', f'{i:03d}.png')
-    
-    intrinsic_dict = {'width': 1920, 'height': 1080, 'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
-    return id_list, pose_dict, image_dict, intrinsic_dict
+        
+        image = cv2.imread(os.path.join(source, f"{frame['file_path']}.png"))
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        ret, binary = cv2.threshold(gray, 0, 1, cv2.THRESH_BINARY)
+        foreground_mask = cv2.bitwise_not(binary)
+
+        # Convert image to grayscale
+        
+        image_dict[i] = image
+        mask_dict[i] = foreground_mask
+
+    intrinsic_dict = {'width': W, 'height': H, 'fx': focal, 'fy': focal, 'cx': W//2, 'cy': H//2}
+    return id_list, pose_dict, image_dict, mask_dict, intrinsic_dict
         
 import requests
 from rich.progress import track
@@ -105,7 +136,8 @@ def get_vocab_tree():
                     f.flush()
     return vocab_tree_filename
 
-def create_masked_image(image_path: str, mask_path: str) -> np.ndarray:
+
+def create_masked_image(image: str, mask) -> np.ndarray:
     """
     Create a masked image by applying a mask to an image and making the background white.
 
@@ -113,13 +145,6 @@ def create_masked_image(image_path: str, mask_path: str) -> np.ndarray:
     :param mask_path: Path to the mask file.
     :return: Masked image with white background.
     """
-    # Load image and mask
-    image = cv2.imread(image_path)
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-
-    # Ensure mask is binary so multiply operation works as expected
-    _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-
     # Resize the mask to match the size of the image
     mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
 
@@ -140,82 +165,69 @@ def create_masked_image(image_path: str, mask_path: str) -> np.ndarray:
 
     return final_image
 
-@click.command()
-@click.option('--data', type=str, help='path to data dir')
-@click.option('--output-dir', type=str, help='path to output dir')
-@click.option('--matching-method', type=str, default='exhaustive_matcher', help='matching method to use (default: squential_matcher)')
-def main(data, output_dir, matching_method):
-    source = data
-    target = output_dir
-    os.makedirs(target, exist_ok=True)
-    
-    # Copy images and mask
-    source_images_dir  = os.path.join(source, 'images')
-    target_images_dir = os.path.join(target, 'images')
-    source_mask_dir = os.path.join(source, 'mask')
-    target_mask_dir = os.path.join(target, 'mask')
-    
-    assert os.path.exists(source_mask_dir), "Mask directory does not exist"
-    assert os.path.exists(source_images_dir), "Image directory does not exist"
-    
-    if os.path.exists(target_images_dir):
-        shutil.rmtree(target_images_dir)
-    if os.path.exists(target_mask_dir):
-        shutil.rmtree(target_mask_dir)
-        
-    shutil.copytree(source_images_dir, target_images_dir)
-    shutil.copytree(source_mask_dir, target_mask_dir)
-        
-    # Generate masked_images
-    masked_image_dir = os.path.join(target, 'masked_image')
-    os.makedirs(masked_image_dir, exist_ok=True)
-    # Iterate over images in the image directory
-    for image_file in tqdm(os.listdir(target_images_dir)):
-        # Construct full image path
-        image_path = os.path.join(target_images_dir, image_file)
+def main(args):
+    source = args.data
+    target = args.output_dir
 
-        # Construct corresponding mask path
-        mask_file = image_file  # Assumes mask and image files have the same name
-        mask_path = os.path.join(target_mask_dir, mask_file)
+    # Create a sparse reconstruction folder
+    sparse_reconstruction_folder = os.path.join(target, 'sparse')
+    os.makedirs(sparse_reconstruction_folder, exist_ok=True)
 
-        # Create masked image
-        masked_image = create_masked_image(image_path, mask_path)
-
-        # Save masked image
-        masked_image_path = os.path.join(masked_image_dir, image_file)
-        cv2.imwrite(masked_image_path, masked_image)
+    # Load data
+    id_list, pose_dict, image_dict, mask_dict, intrinsic_dict = load_from_blender(args.data)
     
+    # Cache data
+    images_folder = os.path.join(target, 'images')
+    mask_folder = os.path.join(target, 'mask')
+    masked_image_folder = os.path.join(target, 'masked_image')
+    
+    os.makedirs(images_folder, exist_ok=True)
+    os.makedirs(mask_folder, exist_ok=True)
+    os.makedirs(masked_image_folder, exist_ok=True)
+    for _id in id_list:
+        _image = image_dict[_id]
+        _, _mask = cv2.threshold(mask_dict[_id], 1, 255, cv2.THRESH_BINARY)
+        cv2.imwrite(os.path.join(images_folder, f'{_id}.png'), _image)
+        cv2.imwrite(os.path.join(mask_folder, f'{_id}.png'), _mask)
+        masked_image = create_masked_image(_image, _mask)
+        cv2.imwrite(os.path.join(masked_image_folder, f'{_id}.png'), masked_image)
+    
+    # Create cameras.txt file
+    create_cameras_and_points_txt(target, intrinsic_dict)
+
     # Run feature_extractor to extract feature
     if os.path.exists(f'{target}/database.db'):
         os.remove(f'{target}/database.db')
-        
-    feature_extractor_command = f'{colmap_bin} feature_extractor --database_path {target}/database.db --image_path {target}/masked_image > {target}/log.txt'
+    feature_extractor_command = f'{colmap_bin} feature_extractor --database_path {target}/database.db --image_path {target}/images > {target}/log.txt'
     feature_extraction_time, feature_extraction_return_code = run_command(feature_extractor_command, "Running feature_extractor...")
 
-    if matching_method == 'vocab_tree_matcher':
+    if args.matching_method == 'vocab_tree_matcher':
         vocab_tree_filename = get_vocab_tree()
         matcher_command = f'{colmap_bin} vocab_tree_matcher --database_path {target}/database.db --VocabTreeMatching.vocab_tree_path {str(vocab_tree_filename)} >> {target}/log.txt'
-    elif matching_method == 'exhaustive_matcher':
+    elif args.matching_method == 'exhaustive_matcher':
         matcher_command = f'{colmap_bin} exhaustive_matcher --database_path {target}/database.db >> {target}/log.txt'
-    elif matching_method == 'spatial_matcher':
+    elif args.matching_method == 'spatial_matcher':
         matcher_command = f'{colmap_bin} spatial_matcher --database_path {target}/database.db --SpatialMatching.is_gps 0 --SpatialMatching.ignore_z 0 >> {target}/log.txt'
-    elif matching_method == 'squential_matcher':
+    elif args.matching_method == 'squential_matcher':
         matcher_command = f'{colmap_bin} sequential_matcher --database_path {target}/database.db >> {target}/log.txt'
 
-    matching_time, matching_return_code = run_command(matcher_command, f"Running {matching_method}...")
+    matching_time, matching_return_code = run_command(matcher_command, f"Running {args.matching_method}...")
 
-    source_reconstruction_folder = os.path.join(source, 'sparse/0')
-    sparse_reconstruction_folder = os.path.join(target, 'sparse/0')
-    os.makedirs(sparse_reconstruction_folder, exist_ok=True)
+    db = COLMAPDatabase.connect(f'{target}/database.db')
+    images = list(db.execute('select * from images'))
+    create_images_txt(target, id_list, pose_dict, images)
+
     # Run point_triangulator to compute the 3D points
     point_triangulator_command = f'{colmap_bin} point_triangulator --database_path {target}/database.db --image_path {target}/masked_image \
-                                        --input_path {source_reconstruction_folder} --output_path {sparse_reconstruction_folder} \
-                                        --Mapper.tri_min_angle 15 --Mapper.tri_merge_max_reproj_error 0.5 --clear_points 1 >> {target}/log.txt'
+                                        --input_path {target}/model --output_path {sparse_reconstruction_folder} \
+                                        --Mapper.tri_min_angle 10 --Mapper.tri_merge_max_reproj_error 1 >> {target}/log.txt'
     point_triangulation_time, point_triangulation_return_code = run_command(point_triangulator_command, "Running point_triangulator...")
     
     # Run model_converter to convert the sparse points results
-    model_converter_command = f'{colmap_bin} model_converter --input_path {sparse_reconstruction_folder} --output_path {target}/sparse/0/points3D.ply --output_type PLY'
+    model_converter_command = f'{colmap_bin} model_converter --input_path {sparse_reconstruction_folder} --output_path {target}/sparse/points3D.ply --output_type PLY'
     run_command(model_converter_command, "Exporting sparse points...")
     
+    
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+    main(args)

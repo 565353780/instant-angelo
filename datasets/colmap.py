@@ -2,6 +2,8 @@ import os
 import math
 import numpy as np
 from PIL import Image
+import cv2
+import json
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,16 @@ def get_center(pts):
     valid = (dis > mean - 1.5 * std) & (dis < mean + 1.5 * std) & (dis > mean - (q75 - q25) * 1.5) & (dis < mean + (q75 - q25) * 1.5)
     center = pts[valid].mean(0)
     return center
+
+def get_center_and_scale(pts):
+    center = pts.mean(0)
+    dis = (pts - center[None,:]).norm(p=2, dim=-1)
+    mean, std = dis.mean(), dis.std()
+    q25, q75 = torch.quantile(dis, 0.25), torch.quantile(dis, 0.75)
+    valid = (dis > mean - 1.5 * std) & (dis < mean + 1.5 * std) & (dis > mean - (q75 - q25) * 1.5) & (dis < mean + (q75 - q25) * 1.5)
+    center = pts[valid].mean(0)
+    scale = pts[valid].norm(p=2, dim=-1).max()
+    return center, scale
 
 def normalize_poses(poses, pts, up_est_method, center_est_method, pts3d_normal=None):
     if center_est_method == 'camera':
@@ -80,13 +92,12 @@ def normalize_poses(poses, pts, up_est_method, center_est_method, pts3d_normal=N
         # translation and scaling
         poses_min, poses_max = poses_norm[...,3].min(0)[0], poses_norm[...,3].max(0)[0]
         pts_fg = pts[(poses_min[0] < pts[:,0]) & (pts[:,0] < poses_max[0]) & (poses_min[1] < pts[:,1]) & (pts[:,1] < poses_max[1])]
-        center = get_center(pts_fg)
+        center, scale = get_center_and_scale(pts_fg)
         tc = center.reshape(3, 1)
         t = -tc
         poses_homo = torch.cat([poses_norm, torch.as_tensor([[[0.,0.,0.,1.]]]).expand(poses_norm.shape[0], -1, -1)], dim=1)
         inv_trans = torch.cat([torch.cat([torch.eye(3), t], dim=1), torch.as_tensor([[0.,0.,0.,1.]])], dim=0)
         poses_norm = (inv_trans @ poses_homo)[:,:3]
-        scale = poses_norm[...,3].norm(p=2, dim=-1).min()
         poses_norm[...,3] /= scale
         pts = (inv_trans @ torch.cat([pts, torch.ones_like(pts[:,0:1])], dim=-1)[...,None])[:,:3,0]
         # apply the rotation to the point cloud normal
@@ -136,11 +147,10 @@ def create_spheric_poses(cameras, n_steps=120):
     return all_c2w
 
 from models.utils import scale_anything
-from nerfacc import ContractionType
 def contract_to_unisphere(x, radius, contraction_type):
-    if contraction_type == ContractionType.AABB:
+    if contraction_type =='AABB':
         x = scale_anything(x, (-radius, radius), (0, 1))
-    elif contraction_type == ContractionType.UN_BOUNDED_SPHERE:
+    elif contraction_type == 'UN_BOUNDED_SPHERE':
         x = scale_anything(x, (-radius, radius), (0, 1))
         x = x * 2 - 1  # aabb is at [-1, 1]
         mag = x.norm(dim=-1, keepdim=True)
@@ -201,7 +211,7 @@ class ColmapDatasetBase():
                 cy = camdata[1].params[2] * factor
             else:
                 raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
-
+            K = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]).T
             directions = get_ray_directions(w, h, fx, fy, cx, cy)
 
             imdata = read_images_text(os.path.join(self.config.root_dir, 'sparse/0/images.txt'))
@@ -209,7 +219,7 @@ class ColmapDatasetBase():
             mask_dir = os.path.join(self.config.root_dir, 'mask')
             has_mask = os.path.exists(mask_dir)
             apply_mask = has_mask and self.config.apply_mask
-
+            
             all_c2w, all_images, all_fg_masks = [], [], []
             all_fg_indexs, all_bg_indexs = [], []
             for i, d in enumerate(imdata.values()):
@@ -240,8 +250,8 @@ class ColmapDatasetBase():
                     all_bg_indexs.append(bg_index.permute(1, 0))
                     all_fg_masks.append(mask) # (h, w)
                     all_images.append(img)
-
-            all_c2w = torch.stack(all_c2w, dim=0)
+            
+            all_c2w = torch.stack(all_c2w, dim=0)   
 
             if self.config.dense_pcd_path is not None:
                 dense_points_path = os.path.join(self.config.root_dir, self.config.dense_pcd_path)
@@ -273,6 +283,11 @@ class ColmapDatasetBase():
             ColmapDatasetBase.properties = {
                 'w': w,
                 'h': h,
+                'fx': fx,
+                'fy': fy,
+                'cx': cx,
+                'cy': cy,
+                'K': K,
                 'img_wh': img_wh,
                 'factor': factor,
                 'has_mask': has_mask,
@@ -313,7 +328,7 @@ class ColmapDatasetBase():
         self.all_points_confidence = self.all_points_confidence.float()
         self.all_points = self.all_points.float()
         self.pts3d_normal = self.pts3d_normal.float()
-        self.all_points_ = contract_to_unisphere(self.all_points, 1.0, ContractionType.AABB) # points normalized to (0, 1)
+        self.all_points_ = contract_to_unisphere(self.all_points, 1.0, 'AABB') # points normalized to (0, 1)
 
     def query_radius_occ(self, query_points, radius=0.01):
         
@@ -368,6 +383,50 @@ class ColmapDataModule(pl.LightningDataModule):
     def prepare_data(self):
         pass
     
+    def export(self, export_dir: str):
+        """
+        Export all_c2w, all_images, all_fg_masks, and K to the specified directory.
+
+        Args:
+            export_dir (str): The directory where the exported files will be saved.
+        """
+        transformed_data = {
+            "w": self.predict_dataset.w,
+            "h": self.predict_dataset.h,
+            "fl_x": self.predict_dataset.fx,
+            "fl_y": self.predict_dataset.fy,
+            "cx": self.predict_dataset.cx,
+            "cy": self.predict_dataset.cy,
+            "k1": 0,
+            "k2": 0,
+            "p1": 0,
+            "p2": 0,
+            "camera_model": "OPENCV",
+            "frames": []
+        }
+        # save images, poses, intrinsics
+        os.makedirs(f'{export_dir}/images', exist_ok=True)
+        
+        for _id  in range(len(self.predict_dataset.all_images)):
+            pose = self.predict_dataset.all_c2w[_id].cpu().numpy()
+            # pad the pose from [3, 4] to [4, 4]
+            if pose.shape[0] == 3:
+                pose = np.concatenate([pose, np.array([[0,0,0,1]])], axis=0)
+            image = self.predict_dataset.all_images[_id].cpu().numpy() * 255
+            image = image[...,::-1]
+            image = image.astype(np.uint8)
+            image_path = '%s/images/%05d.png'%(export_dir,_id)
+            cv2.imwrite(image_path, image)
+            
+            transformed_frame = {
+                "file_path": "images/%05d.png"%_id,
+                "transform_matrix": pose.tolist(),
+            }
+            transformed_data['frames'].append(transformed_frame)
+        output_data_path = os.path.join(export_dir, 'transforms.json')
+        with open(output_data_path, 'w') as f:
+            f.write(json.dumps(transformed_data, indent=4))
+
     def general_loader(self, dataset, batch_size):
         sampler = None
         return DataLoader(

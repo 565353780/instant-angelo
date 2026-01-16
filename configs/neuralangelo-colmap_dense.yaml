@@ -7,7 +7,7 @@ dataset:
   root_dir: ???
   img_downscale: 2 # specify training image size by either img_wh or img_downscale
   up_est_method: ground # if true, use estimated ground plane normal direction as up direction
-  center_est_method: point
+  center_est_method: lookat
   n_test_traj_steps: 30
   apply_mask: false
   load_data_on_gpu: false
@@ -16,8 +16,8 @@ dataset:
 model:
   name: neus
   radius: 1.5
-  num_samples_per_ray: 512
-  train_num_rays: 256
+  num_samples_per_ray: 1024
+  train_num_rays: 128
   max_train_num_rays: 8192
   grid_prune: true
   grid_prune_occ_thre: 0.001
@@ -34,7 +34,7 @@ model:
   geometry:
     name: volume-sdf
     radius: ${model.radius}
-    feature_dim: 65
+    feature_dim: 13
     grad_type: analytic
     finite_difference_eps: progressive
     isosurface:
@@ -58,13 +58,13 @@ model:
       activation: ReLU
       output_activation: none
       n_neurons: 64
-      n_hidden_layers: 2
+      n_hidden_layers: 1
       sphere_init: true
       sphere_init_radius: 0.5
       weight_norm: true
   texture:
     name: volume-dual-color
-    input_feature_dim: ${add:${model.geometry.feature_dim}, 6} # surface coordinates and normal as additional input
+    input_feature_dim: ${add:${model.geometry.feature_dim},3} # surface normal as additional input
     dir_encoding_config:
       otype: SphericalHarmonics
       degree: 4
@@ -124,7 +124,7 @@ system:
     lambda_rgb_l1: 0.
     lambda_mask: 0.0
     lambda_eikonal: 0.1
-    lambda_curvature: [0, 0, 5.e-2, 5000]
+    lambda_curvature: [0, 0, 5.e-1, 5000]
     lambda_sparsity: 0.0
     lambda_distortion: 0.0
     lambda_distortion_bg: 0.0
