@@ -12,7 +12,7 @@ import open3d as o3d
 
 import datasets
 from datasets.colmap_utils import \
-    read_cameras_binary, read_images_binary, read_points3d_binary
+    read_cameras_binary, read_cameras_text, read_images_binary, read_images_text, read_points3d_binary
 from models.ray_utils import get_ray_directions
 from utils.misc import get_rank
 
@@ -170,7 +170,7 @@ class ColmapDatasetBase():
         self.rank = get_rank()
 
         if not ColmapDatasetBase.initialized:
-            camdata = read_cameras_binary(os.path.join(self.config.root_dir, 'sparse/0/cameras.bin'))
+            camdata = read_cameras_text(os.path.join(self.config.root_dir, 'sparse/0/cameras.txt'))
 
             H = int(camdata[1].height)
             W = int(camdata[1].width)
@@ -201,15 +201,15 @@ class ColmapDatasetBase():
                 cy = camdata[1].params[2] * factor
             else:
                 raise ValueError(f"Please parse the intrinsics for camera model {camdata[1].model}!")
-            
+
             directions = get_ray_directions(w, h, fx, fy, cx, cy)
 
-            imdata = read_images_binary(os.path.join(self.config.root_dir, 'sparse/0/images.bin'))
+            imdata = read_images_text(os.path.join(self.config.root_dir, 'sparse/0/images.txt'))
 
             mask_dir = os.path.join(self.config.root_dir, 'mask')
             has_mask = os.path.exists(mask_dir)
             apply_mask = has_mask and self.config.apply_mask
-            
+
             all_c2w, all_images, all_fg_masks = [], [], []
             all_fg_indexs, all_bg_indexs = [], []
             for i, d in enumerate(imdata.values()):
@@ -240,8 +240,8 @@ class ColmapDatasetBase():
                     all_bg_indexs.append(bg_index.permute(1, 0))
                     all_fg_masks.append(mask) # (h, w)
                     all_images.append(img)
-            
-            all_c2w = torch.stack(all_c2w, dim=0)   
+
+            all_c2w = torch.stack(all_c2w, dim=0)
 
             if self.config.dense_pcd_path is not None:
                 dense_points_path = os.path.join(self.config.root_dir, self.config.dense_pcd_path)
