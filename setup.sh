@@ -12,7 +12,7 @@ pip install matplotlib opencv-python imageio imageio-ffmpeg \
 
 pip install pytorch-lightning <2
 pip install omegaconf==2.2.3
-pip install nerfacc==0.5.3
+pip install nerfacc==0.3.3
 
 cd tiny-cuda-nn
 cmake . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo

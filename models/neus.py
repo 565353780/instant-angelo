@@ -8,8 +8,8 @@ import models
 from models.base import BaseModel
 from models.utils import chunk_batch
 from systems.utils import update_module_step
-from nerfacc import OccGridEstimator, render_weight_from_density, render_weight_from_alpha, accumulate_along_rays
-from nerfacc import ray_aabb_intersect
+from nerfacc import ContractionType, OccupancyGrid, ray_marching, render_weight_from_density, render_weight_from_alpha, accumulate_along_rays
+from nerfacc.intersection import ray_aabb_intersect
 
 
 class VarianceNetwork(nn.Module):
@@ -48,11 +48,12 @@ class NeuSModel(BaseModel):
     def setup(self):
         self.geometry = models.make(self.config.geometry.name, self.config.geometry)
         self.texture = models.make(self.config.texture.name, self.config.texture)
-        self.geometry.contraction_type = 'AABB'
+        self.geometry.contraction_type = ContractionType.AABB
 
         if self.config.learned_background:
             self.geometry_bg = models.make(self.config.geometry_bg.name, self.config.geometry_bg)
             self.texture_bg = models.make(self.config.texture_bg.name, self.config.texture_bg)
+            self.geometry_bg.contraction_type = ContractionType.UN_BOUNDED_SPHERE
             self.near_plane_bg, self.far_plane_bg = 0.1, 1e3
             self.cone_angle_bg = 10**(math.log10(self.far_plane_bg) / self.config.num_samples_per_ray_bg) - 1.
             self.render_step_size_bg = 0.01            
@@ -60,14 +61,16 @@ class NeuSModel(BaseModel):
         self.variance = VarianceNetwork(self.config.variance)
         self.register_buffer('scene_aabb', torch.as_tensor([-self.config.radius, -self.config.radius, -self.config.radius, self.config.radius, self.config.radius, self.config.radius], dtype=torch.float32))
         if self.config.grid_prune:
-            self.occupancy_grid = OccGridEstimator(
+            self.occupancy_grid = OccupancyGrid(
                 roi_aabb=self.scene_aabb,
                 resolution=128,
+                contraction_type=ContractionType.AABB
             )
             if self.config.learned_background:
-                self.occupancy_grid_bg = OccGridEstimator(
+                self.occupancy_grid_bg = OccupancyGrid(
                     roi_aabb=self.scene_aabb,
                     resolution=256,
+                    contraction_type=ContractionType.UN_BOUNDED_SPHERE
                 )
         self.randomized = self.config.randomized
         self.background_color = None
@@ -103,9 +106,9 @@ class NeuSModel(BaseModel):
             return density[...,None] * self.render_step_size_bg
         
         if self.training and self.config.grid_prune:
-            self.occupancy_grid.update_every_n_steps(step=global_step, occ_eval_fn=occ_eval_fn, occ_thre=self.config.get('grid_prune_occ_thre', 0.01))
+            self.occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn, occ_thre=self.config.get('grid_prune_occ_thre', 0.01))
             if self.config.learned_background:
-                self.occupancy_grid_bg.update_every_n_steps(step=global_step, occ_eval_fn=occ_eval_fn_bg, occ_thre=self.config.get('grid_prune_occ_thre_bg', 0.01))
+                self.occupancy_grid_bg.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn_bg, occ_thre=self.config.get('grid_prune_occ_thre_bg', 0.01))
 
     def isosurface(self):
         mesh = self.geometry.isosurface()
@@ -153,9 +156,10 @@ class NeuSModel(BaseModel):
         # note that in nerfacc t_max is set to 1e10 if there is no intersection
         near_plane = torch.where(t_max > 1e9, self.near_plane_bg, t_max)
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = self.occupancy_grid_bg.sampling(
+            ray_indices, t_starts, t_ends = ray_marching(
                 rays_o, rays_d,
                 scene_aabb=None,
+                grid=self.occupancy_grid_bg if self.config.grid_prune else None,
                 sigma_fn=sigma_fn,
                 near_plane=near_plane, far_plane=self.far_plane_bg,
                 render_step_size=self.render_step_size_bg,
@@ -203,9 +207,12 @@ class NeuSModel(BaseModel):
         rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
 
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
+            ray_indices, t_starts, t_ends = ray_marching(
                 rays_o, rays_d,
+                scene_aabb=self.scene_aabb,
+                grid=self.occupancy_grid if self.config.grid_prune else None,
                 alpha_fn=None,
+                near_plane=None, far_plane=None,
                 render_step_size=self.render_step_size,
                 stratified=self.randomized,
                 cone_angle=0.0,
@@ -215,30 +222,29 @@ class NeuSModel(BaseModel):
         ray_indices = ray_indices.long()
         t_origins = rays_o[ray_indices]
         t_dirs = rays_d[ray_indices]
-        midpoints = (t_starts + t_ends)[..., None] / 2.
+        midpoints = (t_starts + t_ends) / 2.
         positions = t_origins + t_dirs * midpoints
         dists = t_ends - t_starts
 
         sdf, sdf_grad, feature, sdf_laplace = self.geometry(positions, with_grad=True, with_feature=True, with_laplace=True)
         normal = F.normalize(sdf_grad, p=2, dim=-1)
-        alpha = self.get_alpha(sdf, normal, t_dirs, dists)
+        alpha = self.get_alpha(sdf, normal, t_dirs, dists)[...,None]
         rgb = self.texture(feature, t_dirs, normal)
 
-        weights, _ = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
-        opacity = accumulate_along_rays(weights, ray_indices=ray_indices, values=None, n_rays=n_rays)
-        depth = accumulate_along_rays(weights,  ray_indices=ray_indices, values=midpoints, n_rays=n_rays)
-        comp_rgb = accumulate_along_rays(weights, ray_indices=ray_indices, values=rgb, n_rays=n_rays)
-        rays_valid = opacity > 0
-        comp_normal = accumulate_along_rays(weights, ray_indices=ray_indices, values=normal, n_rays=n_rays)
+        weights = render_weight_from_alpha(alpha, ray_indices=ray_indices, n_rays=n_rays)
+        opacity = accumulate_along_rays(weights, ray_indices, values=None, n_rays=n_rays)
+        depth = accumulate_along_rays(weights, ray_indices, values=midpoints, n_rays=n_rays)
+        comp_rgb = accumulate_along_rays(weights, ray_indices, values=rgb, n_rays=n_rays)
+        rays_fg = opacity > 0.1
+        comp_normal = accumulate_along_rays(weights, ray_indices, values=normal, n_rays=n_rays)
         comp_normal = F.normalize(comp_normal, p=2, dim=-1)
-        comp_normal[~rays_valid[:, 0]] = 0
-        
+        comp_normal[~rays_fg[:, 0]] = 0
         out = {
             'comp_rgb': comp_rgb,
             'comp_normal': comp_normal,
             'opacity': opacity,
             'depth': depth,
-            'rays_valid': rays_valid,
+            'rays_valid': opacity > 0,
             'num_samples': torch.as_tensor([len(t_starts)], dtype=torch.int32, device=rays.device)
         }
 
@@ -306,7 +312,7 @@ class NeuSModel(BaseModel):
         if export_config.export_vertex_color:
             _, sdf_grad, features = chunk_batch(self.geometry, export_config.chunk_size, False, mesh['v_pos'].to(self.rank), with_grad=True, with_feature=True)
             normal = F.normalize(sdf_grad, p=2, dim=-1)
-            base_color = torch.sigmoid(features[..., :3])
+            base_color = torch.sigmoid(features[..., 1:4])
             mesh['v_rgb'] = base_color.cpu()
             mesh['v_norm'] = normal.cpu()
         return mesh
@@ -318,8 +324,10 @@ class SphericalHarmonicNeuSModel(NeuSModel):
         rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
 
         with torch.no_grad():
-            ray_indices, t_starts, t_ends = self.occupancy_grid.sampling(
+            ray_indices, t_starts, t_ends = ray_marching(
                 rays_o, rays_d,
+                scene_aabb=self.scene_aabb,
+                grid=self.occupancy_grid if self.config.grid_prune else None,
                 alpha_fn=None,
                 near_plane=None, far_plane=None,
                 render_step_size=self.render_step_size,

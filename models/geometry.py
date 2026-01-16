@@ -12,19 +12,22 @@ from models.utils import scale_anything, get_activation, cleanup, chunk_batch
 from models.network_utils import get_encoding, get_mlp, get_encoding_with_network
 from utils.misc import get_rank
 from systems.utils import update_module_step
-import tinycudann as tcnn
+from nerfacc import ContractionType
+
 import trimesh
 
 def contract_to_unisphere(x, radius, contraction_type):
-    if contraction_type == 'AABB':
+    if contraction_type == ContractionType.AABB:
         x = scale_anything(x, (-radius, radius), (0, 1))
-    else:
+    elif contraction_type == ContractionType.UN_BOUNDED_SPHERE:
         x = scale_anything(x, (-radius, radius), (0, 1))
         x = x * 2 - 1  # aabb is at [-1, 1]
         mag = x.norm(dim=-1, keepdim=True)
         mask = mag.squeeze(-1) > 1
         x[mask] = (2 - 1 / mag[mask]) * (x[mask] / mag[mask])
         x = x / 4 + 0.5  # [-inf, inf] is at [0, 1]
+    else:
+        raise NotImplementedError
     return x
 
 '''
@@ -179,19 +182,8 @@ class VolumeSDF(BaseImplicitGeometry):
     def setup(self):
         self.n_output_dims = self.config.feature_dim
         encoding = get_encoding(3, self.config.xyz_encoding_config)
-        pos_encoding = tcnn.Encoding(
-                n_input_dims=3,
-                encoding_config={
-                "otype": "OneBlob", #Component type.
-	            "n_bins": 16
-                },
-                dtype=torch.float
-            )
-        network = get_mlp(encoding.n_output_dims, 1, self.config.mlp_network_config)
-        diffuse_network = get_mlp(encoding.n_output_dims + pos_encoding.n_output_dims, self.n_output_dims, self.config.mlp_network_config)
+        network = get_mlp(encoding.n_output_dims, self.n_output_dims, self.config.mlp_network_config)
         self.encoding, self.network = encoding, network
-        self.diffuse_network = diffuse_network
-        self.pos_encoding = pos_encoding
         self.grad_type = self.config.grad_type
         self.finite_difference_eps = self.config.get('finite_difference_eps', 1e-3)
         # the actual value used in training
@@ -211,9 +203,13 @@ class VolumeSDF(BaseImplicitGeometry):
                 points_ = points # points in the original scale
                 points = contract_to_unisphere(points, self.radius, self.contraction_type) # points normalized to (0, 1)
                 
-                sdf = self.network(self.encoding(points.view(-1, 3)))[..., 0].float()
+                out = self.network(self.encoding(points.view(-1, 3))).view(*points.shape[:-1], self.n_output_dims).float()
+                sdf, feature = out[...,0], out
+                feature = torch.concat([feature, (points * 2 - 1)], dim=-1)
                 if 'sdf_activation' in self.config:
                     sdf = get_activation(self.config.sdf_activation)(sdf + float(self.config.sdf_bias))
+                if 'feature_activation' in self.config:
+                    feature = get_activation(self.config.feature_activation)(feature)
                 if with_grad:
                     if self.grad_type == 'analytic':
                         grad = torch.autograd.grad(
@@ -237,7 +233,7 @@ class VolumeSDF(BaseImplicitGeometry):
                         points_d_sdf = self.network(self.encoding(points_d.view(-1, 3)))[...,0].view(*points.shape[:-1], 6).float()
                         grad = 0.5 * (points_d_sdf[..., 0::2] - points_d_sdf[..., 1::2]) / eps  
                 
-                if with_laplace:
+                if with_laplace or with_auxiliary_feature:
                     eps=self._finite_difference_eps
                     rand_directions=torch.randn_like(points)
                     rand_directions=F.normalize(rand_directions,dim=-1)
@@ -249,6 +245,12 @@ class VolumeSDF(BaseImplicitGeometry):
                     
                     points_shifted=points.clone()+rand_directions*eps
 
+                if with_auxiliary_feature:
+                    points_shifted_ = scale_anything(points_shifted, (-self.radius, self.radius), (0, 1))
+                    points_shifted_feature = self.network(self.encoding(points_shifted_.view(-1, 3))).view(*points.shape[:-1], self.n_output_dims).float()
+                    if 'feature_activation' in self.config:
+                        points_shifted_feature = get_activation(self.config.feature_activation)(points_shifted_feature)
+                if with_laplace:                    
                     offsets = torch.as_tensor(
                     [
                         [eps, 0.0, 0.0],
@@ -276,20 +278,17 @@ class VolumeSDF(BaseImplicitGeometry):
         if with_grad:
             rv.append(grad)
         if with_feature:
-            pos_encoding = self.pos_encoding(points_)
-            hash_encoding = self.encoding(points.view(-1, 3),  False)
-            feature = self.diffuse_network(torch.cat([hash_encoding, pos_encoding], dim=-1))
-            if 'feature_activation' in self.config:
-                feature = get_activation(self.config.feature_activation)(feature)
             rv.append(feature)
         if with_laplace:
             rv.append(laplace)
+        if with_auxiliary_feature:
+            rv.append(points_shifted_feature)
         rv = [v if self.training else v.detach() for v in rv]
         return rv[0] if len(rv) == 1 else rv
 
     def forward_level(self, points):
         points = contract_to_unisphere(points, self.radius, self.contraction_type) # points normalized to (0, 1)
-        sdf = self.network(self.encoding(points.view(-1, 3))).view(*points.shape[:-1], 1)[...,0]
+        sdf = self.network(self.encoding(points.view(-1, 3))).view(*points.shape[:-1], self.n_output_dims)[...,0]
         if 'sdf_activation' in self.config:
             sdf = get_activation(self.config.sdf_activation)(sdf + float(self.config.sdf_bias))
         return sdf
