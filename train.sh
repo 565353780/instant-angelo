@@ -5,15 +5,8 @@ SHAPE_ID="017c6e8b81a17c298baf2aba24fd62fa5a992ba8346bc86b2b5008caf1478873"
 # 长发男人头
 SHAPE_ID="0228c5cdba8393cd4d947ac2e915f769f684c73b87e6939c129611ba665cafcb"
 
-DATA_PATH="${HOME}/chLi/Dataset/pixel_align/${SHAPE_ID}/colmap"
+DATA_PATH="${HOME}/chLi/Dataset/pixel_align/${SHAPE_ID}"
 
-python launch.py \
-  --config configs/neuralangelo-colmap_sparse.yaml \
-  --gpu 3 \
-  --train \
-  dataset.root_dir=${DATA_PATH} \
-  dataset.scene=${SHAPE_ID} \
-  dataset.dense_pcd_path=${DATA_PATH}/sparse/0/points3D.ply \
-  tag=iter50k \
-  seed=0 \
-  trainer.max_steps=50000
+python demo.py \
+  --data_root=${DATA_PATH}/na/ \
+  --logdir=${DATA_PATH}/ia/
